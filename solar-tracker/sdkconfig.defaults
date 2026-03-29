@@ -1,0 +1,6 @@
+# Rust often requires a bigger main task stack size compared to C (default is 3584)
+CONFIG_MAIN_TASK_STACK_SIZE=8192
+
+# Use this to set FreeRTOS kernel tick frequency to 1000 Hz (100 Hz by default).
+# This allows 1 ms granularity for thread sleeps (vTaskDelay).
+CONFIG_FREERTOS_HZ=1000

@@ -1,0 +1,8 @@
+/target
+/.embuild
+/sdkconfig
+/sdkconfig.old
+*.iml
+*.log
+lcd-snapshot.md
+# Build output redirected to D:\esp-target (Windows path length limitation)

@@ -1,0 +1,25 @@
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Claude Code / Playwright session files
+.claude/
+.playwright-mcp/
+solar-tracker/.claude/
+solar-tracker/.playwright-mcp/
+
+# Rust build output (redirected to D:\esp-target due to Windows path limits)
+solar-tracker/target/
+solar-tracker/.embuild/
+solar-tracker/sdkconfig
+solar-tracker/sdkconfig.old
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Arduino IDE
+*.elf
+*.bin
+*.hex

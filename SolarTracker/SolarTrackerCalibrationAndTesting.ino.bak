@@ -1,0 +1,602 @@
+#include <Wire.h>
+#include <hd44780.h>
+#include <hd44780ioClass/hd44780_I2Cexp.h>
+#include <string.h>
+#include <stdlib.h>
+
+// ================= LCD =================
+hd44780_I2Cexp lcd; // auto-detect I2C address/pins
+const int LCD_COLS = 20;
+const int LCD_ROWS = 4;
+
+// ================= Pins =================
+// Relays (active-LOW). Pairs are direction lines per actuator.
+const int RELAY_PINS[] = { 13,14,  16,17,  18,19,  23,25 };
+const char* RELAY_NAMES[] = {
+  "A dir1", "A dir2",
+  "B dir1", "B dir2",
+  "C dir1", "C dir2",
+  "Buck main", // GPIO23
+  "Buck pre"   // GPIO25
+};
+const int RELAY_COUNT = sizeof(RELAY_PINS) / sizeof(RELAY_PINS[0]);
+
+// Buck relay pins (explicit names)
+const int BUCK_MAIN_PIN = 23; // main
+const int BUCK_PRE_PIN  = 25; // pre-charge
+
+// Actuator → relay pin pairs (dir1, dir2)
+struct Pair { int dir1; int dir2; };
+const Pair ACTUATOR_PINS[] = {
+  { 13, 14 }, // A
+  { 16, 17 }, // B
+  { 18, 19 }  // C
+};
+const int ACTUATOR_COUNT = 3;
+
+// Encoder
+const int ENC_A   = 32;
+const int ENC_B   = 33;
+const int ENC_BTN = 26;  // pull-up; LOW when pressed
+
+// Pots (ESP32 ADC1 inputs)
+const int POT_A = 34, POT_B = 35, POT_C = 36;
+
+// Alert pin (kept configured; not used here)
+const int INA_ALERT = 27;
+
+// ================= Behavior tuning =================
+// Navigation: less sensitive (need more ticks to change page)
+const uint8_t NAV_TICKS_PER_ACTION = 4;   // was 2
+
+// Control mode sensitivity unchanged
+const uint8_t CTRL_TICKS_PER_PULSE = 2;   // require a clear twist before acting
+
+// Base actuator ON time per twist (microwave step)
+const unsigned long PULSE_MS = 30000UL;   // 30s
+
+// Buck sequencing timings (non-blocking)
+const unsigned long PRECHARGE_MS      = 400; // PRE -> MAIN
+const unsigned long MAIN_STAB_MS      = 150; // MAIN stabilize before actuator
+const unsigned long POST_ACT_PAUSE_MS = 100; // after actuator off, before MAIN off
+const unsigned long BUCK_SPINDOWN_MS  = 150; // after MAIN off, before PRE off
+
+// Microwave-like cumulative time (+/-)
+const unsigned long MOVE_INCREMENT_MS = 30000UL;   // +30s/-30s per twist
+const unsigned long MAX_MOVE_MS       = 60000UL;   // cap total run (60s)
+
+// ================= RTC (DS3231 minimal) =================
+namespace RTC {
+  constexpr uint8_t ADDR = 0x68;
+  constexpr uint8_t REG_SECONDS  = 0x00;
+  constexpr uint8_t REG_MINUTES  = 0x01;
+  constexpr uint8_t REG_HOURS    = 0x02;
+  constexpr uint8_t REG_DAY      = 0x03;
+  constexpr uint8_t REG_DATE     = 0x04;
+  constexpr uint8_t REG_MONTH    = 0x05;
+  constexpr uint8_t REG_YEAR     = 0x06;
+
+  inline uint8_t dec2bcd(uint8_t v){ return ((v/10)<<4)|(v%10); }
+  inline uint8_t bcd2dec(uint8_t v){ return (v>>4)*10 + (v&0x0F); }
+
+  bool present() {
+    Wire.beginTransmission(ADDR);
+    return Wire.endTransmission() == 0;
+  }
+
+  struct DT { uint16_t y; uint8_t mo,d,h,mi,s; };
+
+  bool read(DT &dt) {
+    Wire.beginTransmission(ADDR);
+    Wire.write(REG_SECONDS);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom((int)ADDR, 7) != 7) return false;
+    uint8_t sec   = Wire.read();
+    uint8_t min   = Wire.read();
+    uint8_t hour  = Wire.read();
+    (void)Wire.read(); // DOW
+    uint8_t date  = Wire.read();
+    uint8_t month = Wire.read();
+    uint8_t year  = Wire.read();
+
+    dt.s  = bcd2dec(sec & 0x7F);
+    dt.mi = bcd2dec(min & 0x7F);
+    dt.h  = bcd2dec(hour & 0x3F);
+    dt.d  = bcd2dec(date & 0x3F);
+    dt.mo = bcd2dec(month & 0x1F);
+    dt.y  = 2000 + bcd2dec(year);
+    return true;
+  }
+
+  bool write(const DT &dt) {
+    Wire.beginTransmission(ADDR);
+    Wire.write(REG_SECONDS);
+    Wire.write(dec2bcd(dt.s));
+    Wire.write(dec2bcd(dt.mi));
+    Wire.write(dec2bcd(dt.h & 0x3F)); // 24h
+    Wire.write(0x01);                 // DOW placeholder
+    Wire.write(dec2bcd(dt.d));
+    Wire.write(dec2bcd(dt.mo));
+    Wire.write(dec2bcd((uint8_t)(dt.y-2000)));
+    return Wire.endTransmission() == 0;
+  }
+
+  void setFromCompileTimeAlways() {
+    const char* months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    char mStr[4]; mStr[0]=__DATE__[0]; mStr[1]=__DATE__[1]; mStr[2]=__DATE__[2]; mStr[3]='\0';
+    uint8_t month = 1 + (uint8_t)((strstr(months, mStr) - months) / 3);
+
+    uint8_t  day    = (uint8_t)atoi(__DATE__ + 4);
+    uint16_t year   = (uint16_t)atoi(__DATE__ + 7);
+    uint8_t  hour   = (uint8_t)atoi(__TIME__ + 0);
+    uint8_t  minute = (uint8_t)atoi(__TIME__ + 3);
+    uint8_t  second = (uint8_t)atoi(__TIME__ + 6);
+
+    DT dt{year, month, day, hour, minute, second};
+    (void)write(dt);
+  }
+}
+
+// ================= ADC helpers (ESP32) =================
+static inline void setupAdcPins() {
+  analogReadResolution(12); // 0..4095
+  analogSetPinAttenuation(POT_A, ADC_11db); // ~0..3.3V
+  analogSetPinAttenuation(POT_B, ADC_11db);
+  analogSetPinAttenuation(POT_C, ADC_11db);
+}
+static inline int readAdcAvg(int pin, int samples = 12) {
+  long acc = 0;
+  for (int i=0;i<samples;i++) acc += analogRead(pin);
+  return (int)(acc / samples);
+}
+static inline float adcToVolts(int raw) {
+  return raw * (3.3f / 4095.0f); // approx; EPS32 ADC is non-linear but good for calibration
+}
+
+// ================= Encoder handling =================
+int8_t stepFromNibble(uint8_t n) {
+  switch (n) {
+    case 0b0001: case 0b0111: case 0b1110: case 0b1000: return +1;
+    case 0b0010: case 0b1011: case 0b1101: case 0b0100: return -1;
+    default: return 0;
+  }
+}
+inline uint8_t readAB() {
+  uint8_t a = digitalRead(ENC_A);
+  uint8_t b = digitalRead(ENC_B);
+  return (a<<1) | b;
+}
+
+volatile uint8_t encPrev = 0;
+int16_t navAccum = 0;   // for page navigation sensitivity
+int16_t ctrlAccum = 0;  // for control mode sensitivity
+
+bool readButtonPressed() {
+  static bool last = true;
+  bool cur = (digitalRead(ENC_BTN) == LOW);
+  bool pressed = (cur && !last);
+  last = cur;
+  return pressed;
+}
+
+// ================= Pages & modes =================
+enum Page : uint8_t { PAGE_CLOCK=0, PAGE_ACT_A=1, PAGE_ACT_B=2, PAGE_ACT_C=3, PAGE_COUNT=4 };
+Page currentPage = PAGE_CLOCK;
+
+bool controlMode = false;     // true when controlling an actuator
+uint8_t controlActuator = 0;  // 0=A,1=B,2=C when in control mode
+
+// ================= Relay helpers =================
+void allRelaysOff() {
+  for (int i=0;i<RELAY_COUNT;i++) digitalWrite(RELAY_PINS[i], HIGH); // HIGH=OFF (active-LOW)
+}
+inline void actuatorOff(uint8_t idx) {
+  const Pair &p = ACTUATOR_PINS[idx];
+  digitalWrite(p.dir1, HIGH);
+  digitalWrite(p.dir2, HIGH);
+}
+
+// ================= Move FSM (buck + actuator) =================
+enum class MovePhase : uint8_t { Idle, PreOn, MainOn, ActOn, ActOffPause, MainOff, PreOff };
+
+struct MoveFSM {
+  bool active = false;
+  MovePhase phase = MovePhase::Idle;
+  uint8_t actuator = 0;        // 0..2
+  int actPin = -1;             // which dir pin is used this move
+  unsigned long startedAt = 0; // when ActOn actually began
+  unsigned long nextAt = 0;    // when to advance phase (also current end time)
+} move;
+
+void stopActuatorNow() {
+  if (move.phase == MovePhase::ActOn) {
+    digitalWrite(move.actPin, HIGH);                  // actuator OFF
+    move.phase = MovePhase::ActOffPause;
+    move.nextAt = millis() + POST_ACT_PAUSE_MS;       // proceed to MAIN OFF, PRE OFF
+    lcd.setCursor(0,3); lcd.print("Stopping actuator  ");
+  }
+}
+
+void requestMove(uint8_t actuatorIdx, int directionPin) {
+  if (move.active) return;             // ignore if a move is in progress
+  move.active = true;
+  move.phase = MovePhase::PreOn;
+  move.actuator = actuatorIdx;
+  move.actPin = directionPin;
+
+  // safety: ensure actuator relays are off before powering buck
+  actuatorOff(actuatorIdx);
+
+  // 1) Buck PRE ON
+  digitalWrite(BUCK_PRE_PIN, LOW);     // ON
+  move.nextAt = millis() + PRECHARGE_MS;
+
+  // UI hint
+  lcd.setCursor(0,3); lcd.print("Powering buck...   ");
+}
+
+static inline unsigned long clampAddToMax(unsigned long endAt,
+                                          unsigned long startAt,
+                                          unsigned long addMs,
+                                          unsigned long maxDurMs)
+{
+  unsigned long maxEnd = startAt + maxDurMs;
+  unsigned long candidate = endAt + addMs;
+  return (candidate > maxEnd) ? maxEnd : candidate;
+}
+
+void tickMoveFSM() {
+  if (!move.active) return;
+  unsigned long now = millis();
+
+  if ((long)(now - move.nextAt) < 0) {
+    // While waiting, if in ActOn we also keep the countdown fresh
+    if (move.phase == MovePhase::ActOn) {
+      unsigned long rem = (move.nextAt > now) ? (move.nextAt - now) : 0;
+      lcd.setCursor(0,3);
+      lcd.print("Remain: ");
+      unsigned long secs = (rem + 500) / 1000;
+      unsigned long mm = secs / 60;
+      unsigned long ss = secs % 60;
+      if (mm < 10) lcd.print('0'); lcd.print(mm); lcd.print(':');
+      if (ss < 10) lcd.print('0'); lcd.print(ss);
+      lcd.print("           ");
+    }
+    return;
+  }
+
+  switch (move.phase) {
+    case MovePhase::PreOn:
+      // 2) Buck MAIN ON
+      digitalWrite(BUCK_MAIN_PIN, LOW);
+      move.phase = MovePhase::MainOn;
+      move.nextAt = now + MAIN_STAB_MS;
+      lcd.setCursor(0,3); lcd.print("Buck main ON...    ");
+      break;
+
+    case MovePhase::MainOn:
+      // 3) Actuator ON
+      digitalWrite(move.actPin, LOW); // ON (active-LOW)
+      move.phase = MovePhase::ActOn;
+      move.startedAt = now;
+      move.nextAt = now + PULSE_MS;   // initial duration (30s)
+      lcd.setCursor(0,3); lcd.print("Pulsing actuator   ");
+      break;
+
+    case MovePhase::ActOn:
+      // 4) Actuator OFF
+      digitalWrite(move.actPin, HIGH);
+      move.phase = MovePhase::ActOffPause;
+      move.nextAt = now + POST_ACT_PAUSE_MS;
+      lcd.setCursor(0,3); lcd.print("Stopping actuator  ");
+      break;
+
+    case MovePhase::ActOffPause:
+      // 5) Buck MAIN OFF
+      digitalWrite(BUCK_MAIN_PIN, HIGH);
+      move.phase = MovePhase::MainOff;
+      move.nextAt = now + BUCK_SPINDOWN_MS;
+      lcd.setCursor(0,3); lcd.print("Buck main OFF...   ");
+      break;
+
+    case MovePhase::MainOff:
+      // 6) Buck PRE OFF
+      digitalWrite(BUCK_PRE_PIN, HIGH);
+      move.phase = MovePhase::PreOff;
+      move.nextAt = now; // immediate finish
+      lcd.setCursor(0,3); lcd.print("Buck pre OFF       ");
+      break;
+
+    case MovePhase::PreOff:
+      // done
+      move.active = false;
+      move.phase = MovePhase::Idle;
+      move.actPin = -1;
+      lcd.setCursor(0,3); lcd.print("Ready              ");
+      break;
+
+    case MovePhase::Idle:
+      move.active = false;
+      break;
+  }
+}
+
+// ================= UI rendering =================
+unsigned long lastClockRefresh = 0;
+
+// Helper: read the correct pot for an actuator index
+static inline int potPinForAct(uint8_t idx) {
+  return (idx==0) ? POT_A : (idx==1) ? POT_B : POT_C;
+}
+
+void drawClockPage(bool force=false) {
+  unsigned long now = millis();
+  if (!force && (now - lastClockRefresh) < 1000UL) return;
+  lastClockRefresh = now;
+
+  lcd.clear();
+  lcd.setCursor(0,0); lcd.print("Date & Time");
+
+  if (!RTC::present()) {
+    lcd.setCursor(0,2); lcd.print("RTC not found");
+    return;
+  }
+  RTC::DT dt;
+  if (!RTC::read(dt)) {
+    lcd.setCursor(0,2); lcd.print("RTC read error");
+    return;
+  }
+
+  //  YYYY-MM-DD
+  lcd.setCursor(0,1);
+  lcd.print(dt.y); lcd.print('-');
+  if (dt.mo<10) lcd.print('0'); lcd.print(dt.mo); lcd.print('-');
+  if (dt.d<10)  lcd.print('0'); lcd.print(dt.d);
+
+  //  HH:MM:SS
+  lcd.setCursor(0,2);
+  if (dt.h<10)  lcd.print('0'); lcd.print(dt.h);  lcd.print(':');
+  if (dt.mi<10) lcd.print('0'); lcd.print(dt.mi); lcd.print(':');
+  if (dt.s<10)  lcd.print('0'); lcd.print(dt.s);
+
+  lcd.setCursor(0,3);
+  lcd.print("Rotate: pages | Btn: -");
+}
+
+void drawActuatorPage(uint8_t idx, bool entering=false) {
+  if (entering) lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Actuator ");
+  lcd.print(idx==0?'A':idx==1?'B':'C');
+
+  // Line 1: Potentiometer readout for calibration
+  int raw = readAdcAvg(potPinForAct(idx));
+  float v  = adcToVolts(raw);
+  lcd.setCursor(0,1);
+  lcd.print("POT: ");
+  if (raw < 1000) lcd.print(' ');
+  if (raw < 100)  lcd.print(' ');
+  if (raw < 10)   lcd.print(' ');
+  lcd.print(raw);
+  lcd.print("  ");
+  lcd.print(v, 2); lcd.print("V");
+
+  // Line 2: Status
+  lcd.setCursor(0,2);
+  if (!controlMode) {
+    lcd.print("Rotate: next/prev  ");
+    lcd.setCursor(0,3);
+    lcd.print("Btn: Control mode  ");
+  } else {
+    lcd.print("CONTROL: rotate => ");
+    lcd.setCursor(0,3);
+    if (move.active) {
+      unsigned long now = millis();
+      unsigned long rem = (move.nextAt > now) ? (move.nextAt - now) : 0;
+      lcd.print("Remain: ");
+      unsigned long secs = (rem + 500) / 1000;
+      unsigned long mm = secs / 60;
+      unsigned long ss = secs % 60;
+      if (mm < 10) lcd.print('0'); lcd.print(mm); lcd.print(':');
+      if (ss < 10) lcd.print('0'); lcd.print(ss);
+      lcd.print("           ");
+    } else {
+      lcd.print("Dir: CCW<-  ->CW   ");
+    }
+  }
+}
+
+void drawPage(bool force=false) {
+  switch (currentPage) {
+    case PAGE_CLOCK:  drawClockPage(force); break;
+    case PAGE_ACT_A:  drawActuatorPage(0, force); break;
+    case PAGE_ACT_B:  drawActuatorPage(1, force); break;
+    case PAGE_ACT_C:  drawActuatorPage(2, force); break;
+  }
+}
+
+// ================= Encoder-driven behaviors =================
+void handleNavigationStep(int8_t dir) {
+  if (controlMode) {
+    ctrlAccum += dir;
+
+    if (!move.active) {
+      // Start a new move when threshold is reached
+      if (ctrlAccum >= CTRL_TICKS_PER_PULSE) {
+        ctrlAccum = 0;
+        const Pair& p = ACTUATOR_PINS[controlActuator];
+        requestMove(controlActuator, p.dir2); // CW => dir2
+        drawActuatorPage(controlActuator);
+      } else if (ctrlAccum <= -CTRL_TICKS_PER_PULSE) {
+        ctrlAccum = 0;
+        const Pair& p = ACTUATOR_PINS[controlActuator];
+        requestMove(controlActuator, p.dir1); // CCW => dir1
+        drawActuatorPage(controlActuator);
+      }
+    }
+    else if (move.phase == MovePhase::ActOn) {
+      // Adjust remaining time while running (CW +=, CCW -=)
+      unsigned long now = millis();
+      if (ctrlAccum >= CTRL_TICKS_PER_PULSE) {
+        ctrlAccum = 0;
+        move.nextAt = clampAddToMax(move.nextAt, move.startedAt, MOVE_INCREMENT_MS, MAX_MOVE_MS);
+        unsigned long rem = (move.nextAt > now) ? (move.nextAt - now) : 0;
+        lcd.setCursor(0,3);
+        lcd.print("Remain: ");
+        unsigned long secs = (rem + 500) / 1000;
+        unsigned long mm = secs / 60;
+        unsigned long ss = secs % 60;
+        if (mm < 10) lcd.print('0'); lcd.print(mm); lcd.print(':');
+        if (ss < 10) lcd.print('0'); lcd.print(ss);
+        lcd.print(" (+30s)    ");
+      }
+      else if (ctrlAccum <= -CTRL_TICKS_PER_PULSE) {
+        ctrlAccum = 0;
+        unsigned long remain = (move.nextAt > now) ? (move.nextAt - now) : 0;
+        if (remain <= MOVE_INCREMENT_MS) {
+          stopActuatorNow();   // immediately end the move and start buck shutdown
+        } else {
+          move.nextAt -= MOVE_INCREMENT_MS;
+          unsigned long rem = move.nextAt - now;
+          lcd.setCursor(0,3);
+          lcd.print("Remain: ");
+          unsigned long secs = (rem + 500) / 1000;
+          unsigned long mm = secs / 60;
+          unsigned long ss = secs % 60;
+          if (mm < 10) lcd.print('0'); lcd.print(mm); lcd.print(':');
+          if (ss < 10) lcd.print('0'); lcd.print(ss);
+          lcd.print(" (-30s)    ");
+        }
+      }
+    }
+    // Rotations during buck precharge/main-on phases are ignored (short)
+  } else {
+    // Page navigation (less sensitive → need more ticks)
+    navAccum += dir;
+    if (navAccum >= NAV_TICKS_PER_ACTION) {
+      navAccum = 0;
+      currentPage = (Page)((currentPage + 1) % PAGE_COUNT);
+      drawPage(true);
+    } else if (navAccum <= -NAV_TICKS_PER_ACTION) {
+      navAccum = 0;
+      currentPage = (Page)((currentPage + PAGE_COUNT - 1) % PAGE_COUNT);
+      drawPage(true);
+    }
+  }
+}
+
+void pollEncoder() {
+  static uint32_t lastMs = 0;
+  uint32_t now = millis();
+  if (now - lastMs < 1) return;
+  lastMs = now;
+
+  uint8_t curr = readAB();
+  uint8_t nibble = ((encPrev & 0x03) << 2) | (curr & 0x03);
+  int8_t step = stepFromNibble(nibble);
+  if (step != 0) handleNavigationStep(step);
+  encPrev = curr;
+
+  if (readButtonPressed()) {
+    if (currentPage == PAGE_CLOCK) {
+      // nothing on main page
+    } else {
+      // toggle control mode
+      if (!controlMode) {
+        controlMode = true;
+        ctrlAccum = 0;
+        if (currentPage == PAGE_ACT_A) controlActuator = 0;
+        else if (currentPage == PAGE_ACT_B) controlActuator = 1;
+        else controlActuator = 2;
+        actuatorOff(controlActuator);
+        drawActuatorPage(controlActuator, true);
+      } else {
+        controlMode = false;
+        ctrlAccum = 0;
+        // If a move is in progress, let the FSM finish safely.
+        actuatorOff(controlActuator);
+        drawPage(true);
+      }
+    }
+  }
+}
+
+// ================= Setup & Loop =================
+void setup() {
+  // Pins
+  for (int i=0;i<RELAY_COUNT;i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], HIGH); // OFF (active-LOW)
+  }
+  pinMode(ENC_A,   INPUT_PULLUP);
+  pinMode(ENC_B,   INPUT_PULLUP);
+  pinMode(ENC_BTN, INPUT_PULLUP);
+  pinMode(POT_A, INPUT);
+  pinMode(POT_B, INPUT);
+  pinMode(POT_C, INPUT);
+  pinMode(INA_ALERT, INPUT_PULLUP);
+
+  Serial.begin(115200);
+  delay(500);
+  Wire.begin(21,22);
+  Wire.setTimeOut(50);
+
+  // LCD
+  int lcdStatus = lcd.begin(LCD_COLS, LCD_ROWS);
+  if (lcdStatus) {
+    Serial.print(F("LCD init error: ")); Serial.println(-lcdStatus);
+  }
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0,0); lcd.print("Solar Tracker UI");
+  lcd.setCursor(0,1); lcd.print("Pages + Control");
+  lcd.setCursor(0,2); lcd.print("Encoder: nav/ctrl");
+  lcd.setCursor(0,3); lcd.print("Init...");
+
+  // ADC config (ESP32)
+  setupAdcPins();
+
+  // RTC: set from compile time on each upload
+  if (RTC::present()) {
+    RTC::setFromCompileTimeAlways();
+    Serial.println(F("RTC set from compile time."));
+  } else {
+    Serial.println(F("RTC not found (skip set)."));
+  }
+
+  // Encoder initial state
+  encPrev = readAB();
+
+  // Start on clock page
+  currentPage = PAGE_CLOCK;
+  drawPage(true);
+}
+
+void loop() {
+  pollEncoder();
+  tickMoveFSM();
+
+  if (currentPage == PAGE_CLOCK) {
+    drawClockPage(); // refresh once per second
+  }
+
+  // If on an actuator page, refresh pot line occasionally for calibration feel
+  if (!controlMode && (currentPage == PAGE_ACT_A || currentPage == PAGE_ACT_B || currentPage == PAGE_ACT_C)) {
+    static unsigned long lastPotMs = 0;
+    unsigned long now = millis();
+    if (now - lastPotMs > 200UL) { // ~5 Hz update feels responsive
+      lastPotMs = now;
+      uint8_t idx = (currentPage==PAGE_ACT_A)?0:(currentPage==PAGE_ACT_B)?1:2;
+      int raw = readAdcAvg(potPinForAct(idx));
+      float v  = adcToVolts(raw);
+      lcd.setCursor(0,1);
+      lcd.print("POT: ");
+      if (raw < 1000) lcd.print(' ');
+      if (raw < 100)  lcd.print(' ');
+      if (raw < 10)   lcd.print(' ');
+      lcd.print(raw);
+      lcd.print("  ");
+      lcd.print(v, 2); lcd.print("V   "); // pad tail to clear old chars
+    }
+  }
+}
