@@ -31,10 +31,18 @@ void setup() {
   lcd.backlight();
 
   initAdc();
+  Settings::load();
 
   if (RTC::isPresent()) {
-    RTC::setFromCompileTime();
-    Serial.println(F("RTC set from compile time."));
+    // Only seed the RTC if it looks uninitialized (dead coin cell / first boot).
+    // Otherwise the set-time menu would be clobbered on every reboot.
+    RTC::DateTime dt;
+    if (!RTC::read(dt) || dt.year < 2024) {
+      RTC::setFromCompileTime();
+      Serial.println(F("RTC uninitialized; seeded from compile time."));
+    } else {
+      Serial.println(F("RTC OK; keeping current time."));
+    }
   } else {
     Serial.println(F("RTC not found (skip set)."));
   }

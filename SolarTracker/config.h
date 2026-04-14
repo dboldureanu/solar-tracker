@@ -1,18 +1,52 @@
 #pragma once
 
 // ===== Relay Pins (active LOW) =====
-// Each actuator has two direction relays.
+// Each actuator has two direction relays, named by the tracking direction
+// they drive the panels toward: east = morning/low-pot, west = evening/high-pot.
+// Actuator C is wired with swapped polarity relative to A/B; the swap is
+// expressed here so the rest of the code can stay direction-semantic.
 struct ActuatorPins {
-  int dir1;
-  int dir2;
+  int east;
+  int west;
 };
 
 constexpr ActuatorPins ACTUATOR_PINS[] = {
   {13, 14},  // Actuator A
   {16, 17},  // Actuator B
-  {18, 19},  // Actuator C
+  {19, 18},  // Actuator C (swapped in software to match wiring)
 };
 constexpr int ACTUATOR_COUNT = 3;
+
+// Potentiometer calibration: raw ADC values at physical end stops.
+// Measured 2026-04-13 with panels driven manually to each extreme.
+struct PotCalibration {
+  int east_raw;  // extreme east (morning)
+  int west_raw;  // extreme west (evening)
+};
+
+constexpr PotCalibration POT_CAL[] = {
+  {430, 3140},  // A
+  {429, 3200},  // B
+  {400, 3190},  // C
+};
+
+// ===== Monthly tracking window =====
+// For each month: the tracking time window and the pot setpoints at its
+// endpoints. Between start and end, the target pot is linearly interpolated.
+// Outside the window, auto-tracking is idle.
+struct MonthConfig {
+  uint8_t  start_h;
+  uint8_t  start_m;
+  uint16_t start_raw;   // target pot at start-of-window (east-ish)
+  uint8_t  end_h;
+  uint8_t  end_m;
+  uint16_t end_raw;     // target pot at end-of-window (west-ish)
+};
+
+constexpr uint8_t MONTH_COUNT = 12;
+
+// Encoder pulse -> raw ADC delta when editing a pot setpoint.
+constexpr int POT_EDIT_STEP = 10;
 
 // All relay GPIO pins (actuators + buck), for bulk init.
 constexpr int RELAY_PINS[] = {13, 14, 16, 17, 18, 19, 23, 25};

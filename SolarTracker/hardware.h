@@ -59,3 +59,21 @@ namespace RTC {
   bool     write(const DateTime& dt);
   void     setFromCompileTime();
 }
+
+// =====================================================================
+// Settings (monthly tracking config, persisted in ESP32 NVS)
+// =====================================================================
+
+namespace Settings {
+  // Load the 12-month config table from NVS into the in-memory cache.
+  // If no stored data is found, seeds the cache with sane defaults.
+  void load();
+
+  // Persist the in-memory cache back to NVS.
+  void save();
+
+  // Access the cached config for a given month (0=Jan .. 11=Dec).
+  // Mutating the returned reference only affects the cache; call save()
+  // to persist.
+  MonthConfig& month(uint8_t index);
+}

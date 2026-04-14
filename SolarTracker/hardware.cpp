@@ -1,4 +1,5 @@
 #include "hardware.h"
+#include <Preferences.h>
 
 // =====================================================================
 // Relay helpers
@@ -18,8 +19,8 @@ void allRelaysOff() {
 }
 
 void actuatorOff(uint8_t index) {
-  digitalWrite(ACTUATOR_PINS[index].dir1, HIGH);
-  digitalWrite(ACTUATOR_PINS[index].dir2, HIGH);
+  digitalWrite(ACTUATOR_PINS[index].east, HIGH);
+  digitalWrite(ACTUATOR_PINS[index].west, HIGH);
 }
 
 // =====================================================================
@@ -173,3 +174,48 @@ void setFromCompileTime() {
 }
 
 }  // namespace RTC
+
+// =====================================================================
+// Settings (NVS-backed monthly config)
+// =====================================================================
+
+namespace Settings {
+
+static constexpr const char* NS_NAME  = "tracker";
+static constexpr const char* KEY_NAME = "months";
+
+static MonthConfig cache_[MONTH_COUNT];
+
+static void seedDefaults() {
+  // Placeholder values that lie safely inside every actuator's physical
+  // range; the user is expected to recalibrate per month via the UI.
+  for (uint8_t i = 0; i < MONTH_COUNT; i++) {
+    cache_[i] = { 7, 0, 500, 19, 0, 3000 };
+  }
+}
+
+void load() {
+  seedDefaults();
+
+  Preferences p;
+  if (!p.begin(NS_NAME, /*readOnly=*/true)) return;
+
+  size_t n = p.getBytesLength(KEY_NAME);
+  if (n == sizeof(cache_)) {
+    p.getBytes(KEY_NAME, cache_, sizeof(cache_));
+  }
+  p.end();
+}
+
+void save() {
+  Preferences p;
+  if (!p.begin(NS_NAME, /*readOnly=*/false)) return;
+  p.putBytes(KEY_NAME, cache_, sizeof(cache_));
+  p.end();
+}
+
+MonthConfig& month(uint8_t index) {
+  return cache_[index % MONTH_COUNT];
+}
+
+}  // namespace Settings
