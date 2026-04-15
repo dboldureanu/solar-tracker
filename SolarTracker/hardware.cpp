@@ -39,8 +39,27 @@ int readAdcAvg(int pin, int samples) {
   long acc = 0;
   for (int i = 0; i < samples; i++) {
     acc += analogRead(pin);
+    // Spread samples across a full 50 Hz mains cycle (~20 ms for 16 samples)
+    // so hum/PWM aliasing averages out instead of clustering.
+    if (i + 1 < samples) delayMicroseconds(ADC_INTERSAMPLE_US);
   }
   return static_cast<int>(acc / samples);
+}
+
+int readAdcStable(int pin) {
+  // Take ADC_STABLE_SAMPLES independent averages, return the median. One
+  // spike (e.g. a relay flick) lands in a single sample and gets discarded.
+  int buf[ADC_STABLE_SAMPLES];
+  for (int i = 0; i < ADC_STABLE_SAMPLES; i++) {
+    buf[i] = readAdcAvg(pin);
+  }
+  // Insertion sort — tiny N, branch-predictable.
+  for (int i = 1; i < ADC_STABLE_SAMPLES; i++) {
+    int v = buf[i], j = i - 1;
+    while (j >= 0 && buf[j] > v) { buf[j + 1] = buf[j]; j--; }
+    buf[j + 1] = v;
+  }
+  return buf[ADC_STABLE_SAMPLES / 2];
 }
 
 float adcToVolts(int raw) {
@@ -181,12 +200,14 @@ void setFromCompileTime() {
 
 namespace Settings {
 
-static constexpr const char* NS_NAME  = "tracker";
-static constexpr const char* KEY_NAME = "months";
+static constexpr const char* NS_NAME    = "tracker";
+static constexpr const char* KEY_MONTHS = "months";
+static constexpr const char* KEY_SYSTEM = "sys";
 
-static MonthConfig cache_[MONTH_COUNT];
+static MonthConfig  cache_[MONTH_COUNT];
+static SystemConfig sys_cache_;
 
-static void seedDefaults() {
+static void seedMonthDefaults() {
   // Placeholder values that lie safely inside every actuator's physical
   // range; the user is expected to recalibrate per month via the UI.
   for (uint8_t i = 0; i < MONTH_COUNT; i++) {
@@ -194,28 +215,46 @@ static void seedDefaults() {
   }
 }
 
+static void seedSystemDefaults() {
+  sys_cache_.auto_enabled = true;
+  sys_cache_.tick_min     = 5;
+}
+
 void load() {
-  seedDefaults();
+  seedMonthDefaults();
+  seedSystemDefaults();
 
   Preferences p;
   if (!p.begin(NS_NAME, /*readOnly=*/true)) return;
 
-  size_t n = p.getBytesLength(KEY_NAME);
-  if (n == sizeof(cache_)) {
-    p.getBytes(KEY_NAME, cache_, sizeof(cache_));
+  if (p.getBytesLength(KEY_MONTHS) == sizeof(cache_)) {
+    p.getBytes(KEY_MONTHS, cache_, sizeof(cache_));
   }
+  if (p.getBytesLength(KEY_SYSTEM) == sizeof(sys_cache_)) {
+    p.getBytes(KEY_SYSTEM, &sys_cache_, sizeof(sys_cache_));
+  }
+
+  // Clamp loaded values in case an older struct shape snuck through.
+  if (sys_cache_.tick_min < TICK_MIN_MIN) sys_cache_.tick_min = TICK_MIN_MIN;
+  if (sys_cache_.tick_min > TICK_MIN_MAX) sys_cache_.tick_min = TICK_MIN_MAX;
+
   p.end();
 }
 
 void save() {
   Preferences p;
   if (!p.begin(NS_NAME, /*readOnly=*/false)) return;
-  p.putBytes(KEY_NAME, cache_, sizeof(cache_));
+  p.putBytes(KEY_MONTHS, cache_,     sizeof(cache_));
+  p.putBytes(KEY_SYSTEM, &sys_cache_, sizeof(sys_cache_));
   p.end();
 }
 
 MonthConfig& month(uint8_t index) {
   return cache_[index % MONTH_COUNT];
+}
+
+SystemConfig& system() {
+  return sys_cache_;
 }
 
 }  // namespace Settings

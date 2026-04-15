@@ -6,6 +6,7 @@
 #include "config.h"
 #include "fsm.h"
 #include "hardware.h"
+#include "autotrack.h"
 
 enum class Page : uint8_t {
   Clock = 0,
@@ -14,7 +15,8 @@ enum class Page : uint8_t {
   ActuatorC = 3,
   SetClock = 4,
   Config = 5,
-  COUNT = 6,
+  Auto = 6,
+  COUNT = 7,
 };
 
 enum class EditField : uint8_t {
@@ -25,9 +27,17 @@ enum class CfgField : uint8_t {
   Month = 0, StartH, StartM, StartRaw, EndH, EndM, EndRaw, COUNT
 };
 
+enum class AutoField : uint8_t {
+  Enabled = 0, TickMin, COUNT
+};
+
 class UI {
 public:
   void init(hd44780_I2Cexp& lcd);
+
+  // Attach the AutoTrack instance so the UI can render status and trigger
+  // emergency aborts. Must be called before handleInput/refresh.
+  void setAutoTrack(AutoTrack* at) { autotrack_ = at; }
 
   // Call every loop iteration with encoder input.
   void handleInput(Encoder& encoder, MoveFSM& fsm, hd44780_I2Cexp& lcd);
@@ -37,6 +47,12 @@ public:
 
   // Force-draw the current page (used at startup).
   void drawCurrentPage(hd44780_I2Cexp& lcd) { drawPage(lcd, true); }
+
+  // True when the user is in any edit menu or manual-control mode. The
+  // AutoTrack controller uses this as a "stay out of the way" signal.
+  bool isUserBusy() const {
+    return control_mode_ || edit_mode_ || cfg_edit_mode_ || auto_edit_mode_;
+  }
 
 private:
   Page    page_ = Page::Clock;
@@ -56,6 +72,15 @@ private:
   CfgField        cfg_field_     = CfgField::Month;
   int16_t         cfg_accum_     = 0;
 
+  // Auto-page edit state (active only on Page::Auto).
+  bool            auto_edit_mode_ = false;
+  SystemConfig    edit_sys_       = {};
+  AutoField       auto_field_     = AutoField::Enabled;
+  int16_t         auto_accum_     = 0;
+
+  // Injected by SolarTracker.ino; used for status rendering and abort.
+  AutoTrack*      autotrack_      = nullptr;
+
   // Accumulators for encoder sensitivity thresholds.
   int16_t nav_accum_  = 0;
   int16_t ctrl_accum_ = 0;
@@ -71,12 +96,15 @@ private:
                         MoveFSM* fsm = nullptr);
   void drawSetClockPage(hd44780_I2Cexp& lcd, bool force = false);
   void drawConfigPage(hd44780_I2Cexp& lcd, bool force = false);
+  void drawAutoPage(hd44780_I2Cexp& lcd, bool force = false);
+  void renderAutoStatusLine(hd44780_I2Cexp& lcd);  // LCD row 3 on Clock page
 
   // --- Input handling ---
   void handleNavigation(int steps, MoveFSM& fsm, hd44780_I2Cexp& lcd);
   void handleControl(int steps, MoveFSM& fsm, hd44780_I2Cexp& lcd);
   void handleEdit(int steps, hd44780_I2Cexp& lcd);
   void handleCfgEdit(int steps, hd44780_I2Cexp& lcd);
+  void handleAutoEdit(int steps, hd44780_I2Cexp& lcd);
   void handleButton(MoveFSM& fsm, hd44780_I2Cexp& lcd);
 
   // --- Helpers ---
@@ -85,6 +113,7 @@ private:
   static void        adjustField(RTC::DateTime& dt, EditField f, int delta);
   static void        adjustCfgField(MonthConfig& cfg, CfgField f, int delta,
                                     uint8_t* month_index);
+  static void        adjustAutoField(SystemConfig& sys, AutoField f, int delta);
   static const char* monthName(uint8_t m);  // m: 0..11
   void refreshPotReading(hd44780_I2Cexp& lcd, uint8_t index);
 };

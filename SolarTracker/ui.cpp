@@ -18,12 +18,26 @@ void UI::init(hd44780_I2Cexp& lcd) {
 void UI::handleInput(Encoder& encoder, MoveFSM& fsm, hd44780_I2Cexp& lcd) {
   encoder.poll();
 
-  int steps = encoder.consumeSteps();
+  int  steps  = encoder.consumeSteps();
+  bool button = encoder.consumeButtonPress();
+
+  // Emergency stop: any encoder input while auto-track is actively moving
+  // aborts the move and disables auto-track. The input is consumed and
+  // does NOT also navigate / enter edit mode — one action per press.
+  if (autotrack_ && autotrack_->state() == AutoTrack::State::Active
+      && (steps != 0 || button)) {
+    autotrack_->abort(fsm, lcd);
+    drawPage(lcd, true);
+    return;
+  }
+
   if (steps != 0) {
     if (edit_mode_) {
       handleEdit(steps, lcd);
     } else if (cfg_edit_mode_) {
       handleCfgEdit(steps, lcd);
+    } else if (auto_edit_mode_) {
+      handleAutoEdit(steps, lcd);
     } else if (control_mode_) {
       handleControl(steps, fsm, lcd);
     } else {
@@ -31,7 +45,7 @@ void UI::handleInput(Encoder& encoder, MoveFSM& fsm, hd44780_I2Cexp& lcd) {
     }
   }
 
-  if (encoder.consumeButtonPress()) {
+  if (button) {
     handleButton(fsm, lcd);
   }
 }
@@ -81,6 +95,30 @@ void UI::handleControl(int steps, MoveFSM& fsm, hd44780_I2Cexp& lcd) {
 
 void UI::handleButton(MoveFSM& fsm, hd44780_I2Cexp& lcd) {
   if (page_ == Page::Clock) return;  // no action on clock page
+
+  if (page_ == Page::Auto) {
+    if (!auto_edit_mode_) {
+      edit_sys_       = Settings::system();
+      auto_field_     = AutoField::Enabled;
+      auto_accum_     = 0;
+      auto_edit_mode_ = true;
+      drawAutoPage(lcd, true);
+      return;
+    }
+
+    uint8_t next = static_cast<uint8_t>(auto_field_) + 1;
+    if (next >= static_cast<uint8_t>(AutoField::COUNT)) {
+      Settings::system() = edit_sys_;
+      Settings::save();
+      auto_edit_mode_ = false;
+      drawAutoPage(lcd, true);
+    } else {
+      auto_field_ = static_cast<AutoField>(next);
+      auto_accum_ = 0;
+      drawAutoPage(lcd, true);
+    }
+    return;
+  }
 
   if (page_ == Page::Config) {
     if (!cfg_edit_mode_) {
@@ -179,9 +217,15 @@ void UI::refresh(MoveFSM& fsm, hd44780_I2Cexp& lcd) {
     drawConfigPage(lcd);
   }
 
+  // Auto page, view mode: refresh once per second so the status line reflects
+  // IDLE countdown / ACTIVE actuator changes in near real time.
+  if (page_ == Page::Auto && !auto_edit_mode_) {
+    drawAutoPage(lcd);
+  }
+
   // Actuator pages (not in control mode): refresh potentiometer.
   if (!control_mode_ && page_ != Page::Clock && page_ != Page::SetClock
-      && page_ != Page::Config) {
+      && page_ != Page::Config && page_ != Page::Auto) {
     unsigned long now = millis();
     if (now - last_pot_ms_ > POT_REFRESH_MS) {
       last_pot_ms_ = now;
@@ -198,6 +242,7 @@ void UI::drawPage(hd44780_I2Cexp& lcd, bool force) {
     case Page::ActuatorC:  drawActuatorPage(lcd, 2, force); break;
     case Page::SetClock:   drawSetClockPage(lcd, force); break;
     case Page::Config:     drawConfigPage(lcd, force); break;
+    case Page::Auto:       drawAutoPage(lcd, force); break;
     default: break;
   }
 }
@@ -386,8 +431,41 @@ void UI::drawClockPage(hd44780_I2Cexp& lcd, bool force) {
   if (dt.minute < 10) lcd.print('0'); lcd.print(dt.minute); lcd.print(':');
   if (dt.second < 10) lcd.print('0'); lcd.print(dt.second);
 
-  lcd.setCursor(0, 3);
-  lcd.print("Rotate: pages | Btn:-");
+  renderAutoStatusLine(lcd);
+}
+
+void UI::renderAutoStatusLine(hd44780_I2Cexp& lcd) {
+  char buf[21];
+  if (!autotrack_) {
+    snprintf(buf, sizeof(buf), "%-20s", "Auto: ---");
+    lcd.setCursor(0, 3); lcd.print(buf);
+    return;
+  }
+
+  switch (autotrack_->state()) {
+    case AutoTrack::State::Off:
+      snprintf(buf, sizeof(buf), "%-20s", "Auto: off");
+      break;
+    case AutoTrack::State::Outside:
+      snprintf(buf, sizeof(buf), "%-20s", "Auto: out of window");
+      break;
+    case AutoTrack::State::Idle: {
+      uint32_t secs = (autotrack_->msUntilNextTick() + 59999UL) / 60000UL;
+      if (secs > 999) secs = 999;
+      snprintf(buf, sizeof(buf), "Auto: idle  ~%lum     ",
+               static_cast<unsigned long>(secs));
+      buf[20] = '\0';
+      break;
+    }
+    case AutoTrack::State::Active: {
+      uint8_t i = autotrack_->activeActuator();
+      char ch = (i < ACTUATOR_COUNT) ? static_cast<char>('A' + i) : '?';
+      snprintf(buf, sizeof(buf), "Auto: active  [%c]   ", ch);
+      buf[20] = '\0';
+      break;
+    }
+  }
+  lcd.setCursor(0, 3); lcd.print(buf);
 }
 
 void UI::drawActuatorPage(hd44780_I2Cexp& lcd, uint8_t index, bool entering,
@@ -617,4 +695,99 @@ void UI::drawConfigPage(hd44780_I2Cexp& lcd, bool force) {
     snprintf(buf, sizeof(buf), "Rot:chg  %s   ", btn_lbl);
     lcd.print(buf);
   }
+}
+
+// =====================================================================
+// Auto page (master auto-track enable + tick interval)
+// =====================================================================
+
+void UI::handleAutoEdit(int steps, hd44780_I2Cexp& lcd) {
+  auto_accum_ += steps;
+
+  while (auto_accum_ >= CTRL_TICKS_PER_PULSE) {
+    auto_accum_ -= CTRL_TICKS_PER_PULSE;
+    adjustAutoField(edit_sys_, auto_field_, +1);
+  }
+  while (auto_accum_ <= -CTRL_TICKS_PER_PULSE) {
+    auto_accum_ += CTRL_TICKS_PER_PULSE;
+    adjustAutoField(edit_sys_, auto_field_, -1);
+  }
+
+  drawAutoPage(lcd, true);
+}
+
+void UI::adjustAutoField(SystemConfig& sys, AutoField f, int delta) {
+  auto clamp = [](int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+  };
+
+  switch (f) {
+    case AutoField::Enabled:
+      // Either rotation direction toggles; boolean has no meaningful delta.
+      if (delta != 0) sys.auto_enabled = !sys.auto_enabled;
+      break;
+    case AutoField::TickMin:
+      sys.tick_min = static_cast<uint8_t>(
+          clamp(static_cast<int>(sys.tick_min) + delta,
+                TICK_MIN_MIN, TICK_MIN_MAX));
+      break;
+    default: break;
+  }
+}
+
+void UI::drawAutoPage(hd44780_I2Cexp& lcd, bool force) {
+  // View mode: read straight from persisted cache.
+  if (!auto_edit_mode_) {
+    unsigned long now = millis();
+    if (!force && (now - last_clock_ms_) < CLOCK_REFRESH_MS) return;
+    last_clock_ms_ = now;
+
+    const SystemConfig& sys = Settings::system();
+
+    char buf[21];
+    lcd.clear();
+
+    lcd.setCursor(0, 0); lcd.print("Auto Tracking");
+
+    snprintf(buf, sizeof(buf), "Enabled: %s",
+             sys.auto_enabled ? "yes" : "no ");
+    lcd.setCursor(0, 1); lcd.print(buf);
+
+    snprintf(buf, sizeof(buf), "Tick: %u min       ", sys.tick_min);
+    lcd.setCursor(0, 2); lcd.print(buf);
+
+    lcd.setCursor(0, 3); lcd.print("Btn: Edit           ");
+    return;
+  }
+
+  // Edit mode.
+  lcd.clear();
+  char buf[21];
+  const SystemConfig& s = edit_sys_;
+
+  lcd.setCursor(0, 0); lcd.print("Edit Auto Tracking");
+
+  if (auto_field_ == AutoField::Enabled) {
+    snprintf(buf, sizeof(buf), "Enabled: [%s]",
+             s.auto_enabled ? "yes" : "no ");
+  } else {
+    snprintf(buf, sizeof(buf), "Enabled:  %s ",
+             s.auto_enabled ? "yes" : "no ");
+  }
+  lcd.setCursor(0, 1); lcd.print(buf);
+
+  if (auto_field_ == AutoField::TickMin) {
+    snprintf(buf, sizeof(buf), "Tick: [%3u] min   ", s.tick_min);
+  } else {
+    snprintf(buf, sizeof(buf), "Tick:  %3u  min   ", s.tick_min);
+  }
+  lcd.setCursor(0, 2); lcd.print(buf);
+
+  const bool last_field = (static_cast<uint8_t>(auto_field_) + 1
+                           == static_cast<uint8_t>(AutoField::COUNT));
+  lcd.setCursor(0, 3);
+  lcd.print(last_field ? "Rot:chg Btn:save   "
+                       : "Rot:chg Btn:next   ");
 }

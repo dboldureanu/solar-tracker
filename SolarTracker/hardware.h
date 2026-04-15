@@ -16,7 +16,16 @@ void actuatorOff(uint8_t index);
 // =====================================================================
 
 void initAdc();
+
+// Average of N samples spread across ~20 ms. Rejects 50 Hz mains hum and
+// PWM aliasing. Use this for live display and any non-critical reading.
 int  readAdcAvg(int pin, int samples = ADC_SAMPLES);
+
+// Median of ADC_STABLE_SAMPLES readAdcAvg() calls. Slower (~100 ms) but
+// rejects single-sample spikes. Use this before committing to a move
+// decision — not for live display.
+int  readAdcStable(int pin);
+
 float adcToVolts(int raw);
 
 // =====================================================================
@@ -76,4 +85,8 @@ namespace Settings {
   // Mutating the returned reference only affects the cache; call save()
   // to persist.
   MonthConfig& month(uint8_t index);
+
+  // Access the global system config (auto-track enable / tick interval).
+  // Mutating the returned reference only affects the cache; call save().
+  SystemConfig& system();
 }

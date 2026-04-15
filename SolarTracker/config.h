@@ -48,6 +48,31 @@ constexpr uint8_t MONTH_COUNT = 12;
 // Encoder pulse -> raw ADC delta when editing a pot setpoint.
 constexpr int POT_EDIT_STEP = 10;
 
+// ===== System (global auto-tracking) config =====
+// Stored separately from per-month config in NVS.
+struct SystemConfig {
+  bool    auto_enabled;   // master on/off for auto-tracking
+  uint8_t tick_min;       // evaluation interval, minutes (1..180)
+};
+
+// Tick interval bounds.
+constexpr uint8_t TICK_MIN_MIN = 1;
+constexpr uint8_t TICK_MIN_MAX = 180;
+
+// ===== Auto-tracking tuning =====
+// Dead-band around the target pot reading; |target - actual| <= this means
+// "aligned, don't move". Units: raw 12-bit ADC counts.
+constexpr int AUTO_DEADBAND_RAW = 20;
+
+// Stall detection: if the pot hasn't moved by this many raw counts within
+// AUTO_STALL_WINDOW_MS, abort the current actuator's move.
+constexpr int           AUTO_STALL_DELTA_RAW = 10;
+constexpr unsigned long AUTO_STALL_WINDOW_MS = 5000;
+
+// Max consecutive FSM pulses per actuator per auto-track pass. Each pulse
+// is PULSE_MS long (30s), so 3 pulses covers a full stroke (~90s).
+constexpr uint8_t AUTO_MAX_PULSES = 3;
+
 // All relay GPIO pins (actuators + buck), for bulk init.
 constexpr int RELAY_PINS[] = {13, 14, 16, 17, 18, 19, 23, 25};
 constexpr int RELAY_COUNT  = sizeof(RELAY_PINS) / sizeof(RELAY_PINS[0]);
@@ -100,4 +125,12 @@ constexpr unsigned long CLOCK_REFRESH_MS = 1000;   // clock page refresh
 constexpr unsigned long POT_REFRESH_MS   = 200;    // potentiometer readout refresh
 
 // ===== ADC =====
-constexpr int ADC_SAMPLES = 12;  // samples to average per reading
+// 16 samples * ~1250us per sample ~= 20 ms, which covers one full 50 Hz
+// mains cycle. This averages out hum and PWM aliasing that back-to-back
+// samples would miss.
+constexpr int           ADC_SAMPLES              = 16;
+constexpr unsigned long ADC_INTERSAMPLE_US       = 1250;
+
+// Median-of-N reads on top of readAdcAvg, for the few decision points
+// where the occasional spike (e.g. relay click) would cause a bad move.
+constexpr int ADC_STABLE_SAMPLES = 5;  // must be odd

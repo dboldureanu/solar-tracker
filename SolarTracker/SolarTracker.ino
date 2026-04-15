@@ -5,12 +5,14 @@
 #include "config.h"
 #include "hardware.h"
 #include "fsm.h"
+#include "autotrack.h"
 #include "ui.h"
 
 // Global objects
 hd44780_I2Cexp lcd;
 Encoder encoder;
 MoveFSM fsm;
+AutoTrack autotrack;
 UI ui;
 
 void setup() {
@@ -48,11 +50,13 @@ void setup() {
   }
 
   ui.init(lcd);
+  ui.setAutoTrack(&autotrack);
   ui.drawCurrentPage(lcd);
 }
 
 void loop() {
   ui.handleInput(encoder, fsm, lcd);
   fsm.tick(lcd);
+  autotrack.tick(fsm, ui.isUserBusy(), lcd);
   ui.refresh(fsm, lcd);
 }
