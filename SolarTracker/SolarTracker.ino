@@ -30,6 +30,12 @@ void setup() {
   pinMode(INA_ALERT_PIN, INPUT_PULLUP);
 
   Wire.begin(I2C_SDA, I2C_SCL);
+  // Explicitly pin the I2C clock to 100 kHz. Default varies by ESP32 core
+  // version; at 400 kHz the rising edges on a ~20 cm shared bus with only
+  // the hobby modules' weak internal pull-ups are marginal, which causes
+  // occasional character corruption on the LCD. 100 kHz gives each edge
+  // 4x more time to settle.
+  Wire.setClock(100000);
   Wire.setTimeOut(50);
 
   // Let the LCD's internal HD44780 power-on reset finish before we start
