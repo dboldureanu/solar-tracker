@@ -157,10 +157,33 @@ bool read(DateTime& dt) {
 
   dt.second = bcd2dec(sec   & 0x7F);
   dt.minute = bcd2dec(min   & 0x7F);
-  dt.hour   = bcd2dec(hour  & 0x3F);
+
+  // Hours: bit 6 selects 12/24-hour mode. In 12-hour mode, bit 5 is AM/PM
+  // (not part of the BCD hour) and bits 4-0 hold BCD 1..12. In 24-hour
+  // mode, bits 5-0 hold BCD 0..23.
+  if (hour & 0x40) {
+    uint8_t h12 = bcd2dec(hour & 0x1F);   // 1..12
+    bool pm    = hour & 0x20;
+    if (h12 == 12) h12 = 0;               // 12 AM = 00, 12 PM = 12
+    dt.hour = pm ? (h12 + 12) : h12;
+  } else {
+    dt.hour = bcd2dec(hour & 0x3F);
+  }
+
   dt.day    = bcd2dec(date  & 0x3F);
   dt.month  = bcd2dec(month & 0x1F);
   dt.year   = 2000 + bcd2dec(year);
+
+  // Sanity-check every field. If the DS3231 has been corrupted (brown-out,
+  // EMI, counterfeit chip without proper BCD rollover, etc.) decoded values
+  // can land well outside valid ranges. Treat that exactly like a bus error:
+  // the caller (boot seed / clock display) will re-seed or surface the fault.
+  if (dt.second > 59 || dt.minute > 59 || dt.hour > 23 ||
+      dt.month  < 1  || dt.month  > 12 ||
+      dt.day    < 1  || dt.day    > 31 ||
+      dt.year   < 2000 || dt.year > 2099) {
+    return false;
+  }
   return true;
 }
 
@@ -169,7 +192,10 @@ bool write(const DateTime& dt) {
   Wire.write(0x00);  // register: seconds
   Wire.write(dec2bcd(dt.second));
   Wire.write(dec2bcd(dt.minute));
-  Wire.write(dec2bcd(dt.hour & 0x3F));
+  // Explicitly force 24-hour mode (bit 6 = 0). BCD of 0..23 already has
+  // bit 6 = 0 since max is 0x23, but being explicit protects against any
+  // caller that passes a value outside the expected range.
+  Wire.write(dec2bcd(dt.hour) & 0x3F);
   Wire.write(0x01);  // day-of-week placeholder
   Wire.write(dec2bcd(dt.day));
   Wire.write(dec2bcd(dt.month));
