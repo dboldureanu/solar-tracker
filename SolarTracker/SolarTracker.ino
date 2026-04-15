@@ -17,20 +17,46 @@ UI ui;
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
 
-  initRelays();
+  // Long settle delay at the very top of setup(). Wide-input switching
+  // converters (XL7035 / LM2596HV clones) have slow soft-start and poor
+  // transient response at cold boot; giving the 5 V rail a full second
+  // to stabilize before we start drawing current avoids brown-out loops
+  // and marginal I2C init.
+  delay(1000);
+
+  // GPIO inputs first — no current draw, harmless at any rail state.
   encoder.init();
   pinMode(INA_ALERT_PIN, INPUT_PULLUP);
 
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setTimeOut(50);
 
+  // Let the LCD's internal HD44780 power-on reset finish before we start
+  // talking to it (datasheet spec ~40 ms; we give it 200 for margin).
+  delay(200);
+
+  // LCD init with one retry — hd44780 cold-boot occasionally fails on the
+  // first attempt after a marginal power rail and succeeds the second.
   int lcdStatus = lcd.begin(LCD_COLS, LCD_ROWS);
   if (lcdStatus) {
-    Serial.print(F("LCD init error: ")); Serial.println(-lcdStatus);
+    Serial.print(F("LCD init failed: ")); Serial.println(-lcdStatus);
+    delay(500);
+    lcdStatus = lcd.begin(LCD_COLS, LCD_ROWS);
+    if (lcdStatus) {
+      Serial.print(F("LCD init retry failed: ")); Serial.println(-lcdStatus);
+    } else {
+      Serial.println(F("LCD init recovered on retry."));
+    }
   }
   lcd.backlight();
+
+  // Relay init AFTER LCD, matching the legacy firmware order. Keeping this
+  // late means the 8 relay GPIOs stay in high-Z (relay modules pull them
+  // high via their onboard resistors) until after we've successfully
+  // talked to the LCD — fewer simultaneous current draws on the 5 V rail
+  // during the critical I2C init window.
+  initRelays();
 
   initAdc();
   Settings::load();
